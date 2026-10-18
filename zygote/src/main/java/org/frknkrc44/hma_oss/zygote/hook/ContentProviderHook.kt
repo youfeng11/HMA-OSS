@@ -1,12 +1,15 @@
 package org.frknkrc44.hma_oss.zygote.hook
 
 import android.content.AttributionSource
+import android.content.ComponentName
 import android.database.Cursor
 import android.database.MatrixCursor
 import android.net.Uri
+import android.os.Binder
 import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
+import icu.nullptr.hidemyapplist.common.Utils.getUserFromCallingUid
 import org.frknkrc44.hma_oss.zygote.util.CollectionUtils.firstWithType
 import org.frknkrc44.hma_oss.zygote.util.ContentProviderUtils.getOverriddenDatabaseName
 import org.frknkrc44.hma_oss.zygote.util.Logcat.logD
@@ -31,7 +34,7 @@ class ContentProviderHook : IFrameworkHook {
                 val args = frame.args
                 val callingApps = getCallingPackages(args)
 
-                val caller = callingApps.firstOrNull { service.isAnySettingsReplacementsEnabled(it) }
+                val caller = callingApps.firstOrNull { service.isAnySettingsReplacementsEnabled(it) || service.isHookEnabled(it) }
                 if (caller == null) return@hookAfter
 
                 val uriIdx = args.indexOfFirst { it is Uri }
@@ -64,9 +67,14 @@ class ContentProviderHook : IFrameworkHook {
                         val nameInColumns = "name" in columnNames
                         val valueInColumns = "value" in columnNames
 
+                        var value = replacement.value
+                        if (name == Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES) {
+                            value = sanitizeAccessibilityServices(value, caller)
+                        }
+
                         val returnedArray = when {
-                            nameInColumns && valueInColumns -> arrayOf(replacement.name, replacement.value)
-                            valueInColumns -> arrayOf(replacement.value)
+                            nameInColumns && valueInColumns -> arrayOf(replacement.name, value)
+                            valueInColumns -> arrayOf(value)
                             nameInColumns -> arrayOf(replacement.name)
                             else -> return@hookAfter
                         }
@@ -107,7 +115,7 @@ class ContentProviderHook : IFrameworkHook {
 
                         val dbName = getOverriddenDatabaseName(database, name)
                         val replacement = service.getSpoofedSetting(caller, name, dbName)
-                        val value = if (replacement != null) {
+                        var value = if (replacement != null) {
                             logD(TAG) { "@spoofSettings QUERY $name in $database replaced for $caller" }
 
                             filteredEntryCount++
@@ -115,6 +123,14 @@ class ContentProviderHook : IFrameworkHook {
                             replacement.value
                         } else {
                             result.getString(columns.keys.indexOf("value"))
+                        }
+
+                        if (name == Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES) {
+                            val sanitized = sanitizeAccessibilityServices(value, caller)
+                            if (replacement == null && value != null && value != sanitized) {
+                                filteredEntryCount++
+                            }
+                            value = sanitized
                         }
 
                         valueColumn.add(value)
@@ -145,18 +161,20 @@ class ContentProviderHook : IFrameworkHook {
                 }
             }
 
-            hookBefore(
+            hookAfter(
                 CONTENT_PROVIDER_TRANSPORT_CLASS,
                 "call",
             ) { _, frame, returnValue ->
                 val args = frame.args
                 val callingApps = getCallingPackages(args)
-                val caller = callingApps.firstOrNull { service.isAnySettingsReplacementsEnabled(it) }
-                if (caller == null) return@hookBefore
+                val caller = callingApps.firstOrNull { service.isAnySettingsReplacementsEnabled(it) || service.isHookEnabled(it) }
+                if (caller == null) return@hookAfter
 
                 val nameIdx = args.indexOfLast { it is String }
                 val name = args[nameIdx] as? String
-                val method = args[nameIdx - 1] as? String
+                val method = args.getOrNull(nameIdx - 1) as? String
+
+                if (method == null || name == null) return@hookAfter
 
                 logD(TAG) { "@spoofSettings CALL received caller: ${callingApps.contentToString()}, method: $method, name: $name" }
 
@@ -165,18 +183,52 @@ class ContentProviderHook : IFrameworkHook {
                         val database = method.substring(method.indexOf('_') + 1)
                         val replacement = service.getSpoofedSetting(caller, name, database)
                         if (replacement != null) {
+                            var value = replacement.value
+                            if (name == Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES) {
+                                value = sanitizeAccessibilityServices(value, caller)
+                            }
                             logD(TAG) { "@spoofSettings CALL $name in $database replaced for $caller" }
                             returnValue.result = Bundle().apply {
-                                putString(Settings.NameValueTable.VALUE, replacement.value)
+                                putString(Settings.NameValueTable.VALUE, value)
                                 putInt("_generation_index", -1)
                             }
 
                             service.increaseSettingsFilterCount(caller)
+                        } else if (name == Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES && database == "secure") {
+                            val bundle = returnValue.result as? Bundle
+                            val raw = bundle?.getString(Settings.NameValueTable.VALUE)
+                            if (!raw.isNullOrEmpty()) {
+                                val sanitized = sanitizeAccessibilityServices(raw, caller)
+                                if (sanitized != raw) {
+                                    returnValue.result = Bundle().apply {
+                                        putString(Settings.NameValueTable.VALUE, sanitized)
+                                        putInt("_generation_index", -1)
+                                    }
+                                    service.increaseSettingsFilterCount(caller)
+                                }
+                            }
                         }
                     }
                 }
             }
         }
+    }
+
+    private fun sanitizeAccessibilityServices(rawServices: String?, caller: String): String? {
+        if (rawServices.isNullOrEmpty()) return rawServices
+        val callingUserId = getUserFromCallingUid(Binder.getCallingUid())
+        val components = rawServices.split(":")
+        val filtered = mutableListOf<String>()
+        for (compStr in components) {
+            val trimmed = compStr.trim()
+            if (trimmed.isEmpty()) continue
+            val comp = ComponentName.unflattenFromString(trimmed)
+            val pkg = comp?.packageName ?: trimmed.substringBefore("/")
+            if (!service.shouldHide(caller, pkg, callingUserId)) {
+                filtered.add(trimmed)
+            }
+        }
+        return filtered.joinToString(":")
     }
 
     private fun getCallingPackages(args: Array<Any?>): Array<String> = try {
